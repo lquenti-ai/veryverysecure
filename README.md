@@ -224,7 +224,7 @@ For organizations that need recovery, the CLI ships an SSS split/combine tool fi
 
 Exactly one of the following must hold:
 
-1. **Direct TLS.** The server binds TLS itself. No HTTP fallback, no plaintext listener.
+1. **Direct TLS (default).** The server binds TLS itself via `rustls`, reading cert and key from `VVS_TLS_CERT` and `VVS_TLS_KEY`. No HTTP fallback, no plaintext listener. This is the recommended configuration.
 2. **Trusted local proxy.** A reverse proxy terminates TLS and forwards over loopback or a Unix socket to the server. The proxy MUST: (a) forward the `Authorization` header unchanged, (b) exclude `Authorization` from all access logs, (c) not persist request bodies, (d) reject any `X-Forwarded-*` headers from upstream that would let a client spoof a local origin.
 
 Remote TLS termination (cloud load balancer terminating TLS and re-originating HTTP over a shared network) is not supported. The KEK transits that hop in cleartext.
