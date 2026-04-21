@@ -91,9 +91,9 @@ Alice never learns Bob's KEK. Bob never learns Alice's KEK. The server holds the
 
 ```sql
 CREATE TABLE User (
-  Username         TEXT NOT NULL,
+  Username          TEXT NOT NULL,
   UserServerPrivEnc TEXT NOT NULL,  -- nonce || ciphertext, XChaCha20-Poly1305 under KEK
-  UserServerPub    TEXT NOT NULL,   -- X25519 public key, base64url
+  UserServerPub     TEXT NOT NULL,  -- X25519 public key, base64url
   PRIMARY KEY (Username)
 );
 
@@ -134,13 +134,13 @@ All binary values (keys, ciphertexts) are stored as base64url-encoded TEXT. `Key
 ## API Surface (planned)
 
 ```
-POST   /users                          Register user, provide UserServerPub + UserServerPrivEnc
-POST   /projects                       Create project
-POST   /projects/{project}/members     Add user to project
-POST   /projects/{project}/keys        Generate new DEK, return KeyId
-GET    /projects/{project}/keys/{id}   Fetch DEK (authenticated via KEK in header)
-POST   /projects/{project}/keys/{id}/share   Share key with another user
-DELETE /projects/{project}/keys/{id}   Revoke key (owner only)
+POST   /users                               Register user, provide UserServerPub + UserServerPrivEnc
+POST   /projects                            Create project
+POST   /projects/{project}/members          Add user to project
+POST   /projects/{project}/keys             Generate new DEK, return KeyId
+GET    /projects/{project}/keys/{id}        Fetch DEK (authenticated via KEK in header)
+POST   /projects/{project}/keys/{id}/share  Share key with another user
+DELETE /projects/{project}/keys/{id}        Revoke key (owner only)
 ```
 
 All endpoints except registration require `Authorization: Bearer <base64url(KEK)>`. The KEK must never appear in a URL path or query parameter (logged by proxies).
