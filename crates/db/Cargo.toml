@@ -1,0 +1,12 @@
+[package]
+name = "db"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.22.1"
+sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+thiserror = "2.0.18"
+unicode-normalization = "0.1.25"
+uuid = { version = "1.23.1", features = ["v4"] }
+zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
