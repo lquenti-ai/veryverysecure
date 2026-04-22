@@ -27,8 +27,8 @@
 use std::fmt;
 
 use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
     Key as ChaChaKey, XChaCha20Poly1305, XNonce,
+    aead::{Aead, AeadCore, KeyInit, OsRng},
 };
 use crypto_box::{PublicKey, SecretKey};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -48,14 +48,12 @@ pub const XCHACHA_NONCE_LEN: usize = 24;
 pub const AEAD_TAG_LEN: usize = 16;
 
 /// Length of a KEK-wrapped `UserPriv`: `nonce || ciphertext || tag`.
-pub const WRAPPED_USER_PRIV_LEN: usize =
-    XCHACHA_NONCE_LEN + USER_PRIV_LEN + AEAD_TAG_LEN;
+pub const WRAPPED_USER_PRIV_LEN: usize = XCHACHA_NONCE_LEN + USER_PRIV_LEN + AEAD_TAG_LEN;
 
 /// Length of the ephemeral public key prepended to a sealed box.
 pub const SEALED_EPHEMERAL_PUB_LEN: usize = 32;
 /// Length of a sealed DEK: `ephemeral_pub || ciphertext || tag`.
-pub const SEALED_DEK_LEN: usize =
-    SEALED_EPHEMERAL_PUB_LEN + DEK_LEN + AEAD_TAG_LEN;
+pub const SEALED_DEK_LEN: usize = SEALED_EPHEMERAL_PUB_LEN + DEK_LEN + AEAD_TAG_LEN;
 
 /// Errors produced by this crate.
 ///
@@ -147,7 +145,10 @@ pub fn generate_user_keypair() -> (UserPriv, UserPub) {
     let pk = sk.public_key();
     let priv_bytes = sk.to_bytes();
     let pub_bytes = *pk.as_bytes();
-    (UserPriv::from_bytes(priv_bytes), UserPub::from_bytes(pub_bytes))
+    (
+        UserPriv::from_bytes(priv_bytes),
+        UserPub::from_bytes(pub_bytes),
+    )
 }
 
 /// Derive the X25519 public key from a private key. Useful for rewrap flows
@@ -189,7 +190,9 @@ pub fn unwrap_user_priv(kek: &Kek, wrapped: &[u8]) -> Result<UserPriv, CryptoErr
     let cipher = XChaCha20Poly1305::new(ChaChaKey::from_slice(kek.as_bytes()));
 
     let pt = Zeroizing::new(
-        cipher.decrypt(nonce, ct).map_err(|_| CryptoError::Decrypt)?,
+        cipher
+            .decrypt(nonce, ct)
+            .map_err(|_| CryptoError::Decrypt)?,
     );
     if pt.len() != USER_PRIV_LEN {
         return Err(CryptoError::Decrypt);
