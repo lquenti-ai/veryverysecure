@@ -1,6 +1,6 @@
 # veryverysecure
 
-A single-server REST Key Management System (KMS) in Rust implementing envelope encryption with a zero-server-knowledge property: a full database dump is cryptographically useless without per-user client-held keys.
+A single-server REST Key Management System (KMS) implementing envelope encryption with a zero-server-knowledge property: a full database dump is cryptographically useless without per-user client-held keys.
 
 ## Threat Model
 
@@ -34,28 +34,28 @@ KEK (32 random bytes)
   └─XChaCha20-Poly1305──►  UserServerPrivEnc  ◄── nonce prepended
                              UserServerPub      (plaintext, public by nature)
                                │
-                               └─SealedBox──►  ValueEnc (per Permission row)
-                                               └── contains plaintext DEK
+                               └─sealed box──►  ValueEnc (per Permission row)
+                                                └── contains plaintext DEK
 ```
 
 Three key types:
 
 - **KEK** (Key Encryption Key): 32 bytes from a CSPRNG. Generated and stored by the client. Never transmitted except in-request over TLS. Never persisted server-side.
 - **UserServerPriv / UserServerPub**: An X25519 keypair generated at registration. The public key is stored plaintext. The private key is encrypted under the KEK using XChaCha20-Poly1305 and stored as `nonce || ciphertext`.
-- **DEK** (Data Encryption Key): 32 bytes from a CSPRNG. The actual value the user stores in the KMS. Encrypted per-user under their X25519 public key via `SealedBox`.
+- **DEK** (Data Encryption Key): 32 bytes from a CSPRNG. The actual value the user stores in the KMS. Encrypted per-user under their X25519 public key via an *anonymous sealed box* — an ephemeral X25519 keypair encrypts to the recipient's pubkey using XSalsa20-Poly1305 with a deterministic, hash-derived nonce; the ephemeral pubkey is prepended to the ciphertext. No sender authentication. (libsodium calls this construction `SealedBox` / `crypto_box_seal`.)
 
 ### Algorithms
 
-| Operation | Algorithm | Crate |
-|---|---|---|
-| Wrap/unwrap `UserServerPriv` | XChaCha20-Poly1305 | `chacha20poly1305` |
-| Encrypt/decrypt DEK per user | X25519 + XSalsa20-Poly1305 (`SealedBox`) | `crypto_box` |
-| Key generation | `OsRng` | `rand` |
-| Secret zeroing | `ZeroizeOnDrop` | `zeroize` |
+| Operation | Algorithm |
+|---|---|
+| Wrap/unwrap `UserServerPriv` | XChaCha20-Poly1305 |
+| Encrypt/decrypt DEK per user | Anonymous sealed box: X25519 + XSalsa20-Poly1305, ephemeral sender key |
+| Key generation | OS CSPRNG (`/dev/urandom`, `getrandom(2)`, or platform equivalent) |
+| Secret zeroing | Explicit memory wipe on every secret's drop/free path |
 
 **Why XChaCha20 over AES-256-GCM:** 192-bit nonce makes random nonce generation unconditionally safe (birthday bound at 2^96 vs 2^48 for AES-GCM's 96-bit nonce). Constant-time in software without AES-NI.
 
-**Why SealedBox over RSA-OAEP:** 32-byte keys vs 256-512 bytes, µs-range operations vs ms-range, constant-time by construction, no padding oracle attack surface.
+**Why a sealed box over RSA-OAEP:** 32-byte keys vs 256-512 bytes, µs-range operations vs ms-range, constant-time by construction, no padding oracle attack surface.
 
 ### Authentication
 
@@ -71,8 +71,8 @@ There are no passwords or password hashes stored. Authentication is implicit in 
             decrypt(UserServerPrivEnc, KEK) → UserServerPriv   [401 on tag failure]
             SELECT ValueEnc FROM Permission
               WHERE Username = ? AND KeyId = ?
-            SealedBox::open(ValueEnc, UserServerPub, UserServerPriv) → DEK
-            zeroize(UserServerPriv)
+            seal_open(ValueEnc, UserServerPub, UserServerPriv) → DEK
+            wipe(UserServerPriv)
             return DEK
 
 3. Client:  uses DEK locally, discards it
@@ -84,9 +84,9 @@ There are no passwords or password hashes stored. Authentication is implicit in 
 1. Alice authenticates (decrypts her UserServerPriv)
 2. Alice opens her Permission row → plaintext DEK
 3. Server fetches Bob's UserServerPub from User table
-4. Server re-encrypts: SealedBox::encrypt(DEK, bob_pub) → bob_ValueEnc
+4. Server re-encrypts: seal(DEK, bob_pub) → bob_ValueEnc
 5. INSERT Permission(Bob, project, key_id, bob_ValueEnc, IsOwner=0)
-6. zeroize all intermediates
+6. wipe all intermediates
 ```
 
 Alice never learns Bob's KEK. Bob never learns Alice's KEK. The server holds the DEK plaintext only ephemerally in RAM during step 4.
@@ -98,10 +98,10 @@ Alice never learns Bob's KEK. Bob never learns Alice's KEK. The server holds the
 A rogue DBA is in scope for the threat model, and the current design does **not** fully defend against row substitution on write paths. Two concrete attacks exist; both are accepted for 1.0 and addressed in [Future Work](#future-work).
 
 **(1) DEK substitution via `Permission.ValueEnc` swap.**
-The DBA generates their own `DEK'`, computes `SealedBox(DEK', alice_pub)` (Alice's public key is, by design, plaintext in the DB), and overwrites Alice's `ValueEnc` row. On the next fetch, Alice unwraps `DEK'` — a value chosen by the attacker — with no integrity signal that it differs from the original. If Alice uses the DEK to encrypt application data stored elsewhere, the attacker can later decrypt that data. `SealedBox` has no AAD slot, so binding `(Username, Projectname, KeyId)` cryptographically into the ciphertext requires either a signature layer or a switch to HPKE.
+The DBA generates their own `DEK'`, computes `seal(DEK', alice_pub)` (Alice's public key is, by design, plaintext in the DB), and overwrites Alice's `ValueEnc` row. On the next fetch, Alice unwraps `DEK'` — a value chosen by the attacker — with no integrity signal that it differs from the original. If Alice uses the DEK to encrypt application data stored elsewhere, the attacker can later decrypt that data. The sealed-box construction has no AAD slot, so binding `(Username, Projectname, KeyId)` cryptographically into the ciphertext requires either a signature layer or a switch to HPKE.
 
 **(2) Public-key substitution at share time.**
-The DBA replaces `Bob.UserServerPub` with an attacker-controlled pubkey just before Alice shares a key to Bob. The server (acting honestly) computes `SealedBox(DEK, attacker_pub)` and writes it into Bob's Permission row. The attacker can now decrypt. Bob's legitimate fetches will fail (integrity tag mismatch against his real priv), so this is detectable *after the fact* — but the DEK has already leaked. Defense requires a trust root for public keys (TOFU pinning in the client, a signed pubkey record, or an out-of-band fingerprint check).
+The DBA replaces `Bob.UserServerPub` with an attacker-controlled pubkey just before Alice shares a key to Bob. The server (acting honestly) computes `seal(DEK, attacker_pub)` and writes it into Bob's Permission row. The attacker can now decrypt. Bob's legitimate fetches will fail (integrity tag mismatch against his real priv), so this is detectable *after the fact* — but the DEK has already leaked. Defense requires a trust root for public keys (TOFU pinning in the client, a signed pubkey record, or an out-of-band fingerprint check).
 
 Note that `UserServerPrivEnc` substitution alone is *not* an integrity attack — swapping it causes the AEAD to fail on the legitimate KEK and the user gets a 401. It is a denial-of-service vector, not a confidentiality one.
 
@@ -130,7 +130,7 @@ CREATE TABLE Permission (
   Username    TEXT NOT NULL REFERENCES User(Username) ON DELETE CASCADE,
   Projectname TEXT NOT NULL REFERENCES Project(Projectname) ON DELETE CASCADE,
   KeyId       TEXT NOT NULL,
-  ValueEnc    BLOB NOT NULL,  -- SealedBox(DEK, UserServerPub) raw bytes
+  ValueEnc    BLOB NOT NULL,  -- sealed box of DEK to UserServerPub, raw bytes
   IsOwner     INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (Username, Projectname, KeyId)
 );
@@ -145,17 +145,6 @@ CREATE UNIQUE INDEX OneOwnerPerKey
 Binary values (keys, ciphertexts, nonces) are stored as `BLOB` — no base64 at rest. Base64url is used only on the wire. `KeyId` is a server-generated UUIDv4; client-supplied IDs are rejected. Usernames are NFC-normalized at the API boundary before any DB operation to prevent Unicode confusion attacks.
 
 Note on DEK uniqueness: the 32-byte DEK plaintext is never stored server-side, so no DB-level constraint on its value exists. DEKs are unique by birthday bound on 256 random bits — collision is not a practical concern. `KeyId` uniqueness is handled by the Permission primary key and UUIDv4 generation; hardening against the theoretical UUIDv4 collision is tracked in [Future Work](#future-work).
-
-## Stack
-
-- **Runtime**: tokio
-- **HTTP**: Axum
-- **Database**: sqlx (compile-time query verification) + SQLite (WAL mode)
-- **Crypto**: `crypto_box`, `chacha20poly1305`, `rand`, `zeroize` (`ZeroizeOnDrop` is the sole wrapper convention for secret material)
-- **Serialization**: serde + serde_json
-- **Errors**: `thiserror` (typed domain errors) + `anyhow` (application layer)
-- **Unit/integration tests**: `cargo test` + `tokio::test`
-- **E2E tests**: pytest with contextmanager-based server lifecycle fixtures
 
 ## API Surface (planned)
 
@@ -173,11 +162,11 @@ All endpoints except registration require `Authorization: Bearer <base64url(KEK)
 
 ## Interface Split: HTTP vs CLI
 
-Frequent, per-request operations are exposed over HTTP. Infrequent privileged operations (registration, project creation, KEK rotation, SSS) live in a CLI (`vvs-admin`) that talks to the SQLite file directly via the same `db` module the server uses. This keeps the public attack surface small and makes privileged actions auditable through shell history rather than request logs.
+Frequent, per-request operations are exposed over HTTP. Infrequent privileged operations (registration, project creation, KEK rotation, SSS) live in a CLI (`vvs-admin`) that talks to the SQLite file directly via the same data-access layer the server uses. This keeps the public attack surface small and makes privileged actions auditable through shell history rather than request logs.
 
 **The server must be stopped while `vvs-admin` runs.** The CLI does not coordinate with a live server; it expects exclusive write access. This is a deliberate operational constraint — privileged operations are rare, and requiring downtime eliminates a class of concurrency bugs and ensures the CLI never races with a request.
 
-The `db` module is a single crate in the workspace, depended on by both the `server` binary and the `vvs-admin` binary. There is no second schema, no parallel query set.
+The data-access layer is a single shared library, used by both the server and the `vvs-admin` CLI. There is no second schema, no parallel query set.
 
 ### HTTP API
 
@@ -224,7 +213,7 @@ For organizations that need recovery, the CLI ships an SSS split/combine tool fi
 
 Exactly one of the following must hold:
 
-1. **Direct TLS (default).** The server binds TLS itself via `rustls`, reading cert and key from `VVS_TLS_CERT` and `VVS_TLS_KEY`. No HTTP fallback, no plaintext listener. This is the recommended configuration.
+1. **Direct TLS (default).** The server binds TLS itself, reading cert and key from `VVS_TLS_CERT` and `VVS_TLS_KEY`. No HTTP fallback, no plaintext listener. This is the recommended configuration.
 2. **Trusted local proxy.** A reverse proxy terminates TLS and forwards over loopback or a Unix socket to the server. The proxy MUST: (a) forward the `Authorization` header unchanged, (b) exclude `Authorization` from all access logs, (c) not persist request bodies, (d) reject any `X-Forwarded-*` headers from upstream that would let a client spoof a local origin.
 
 Remote TLS termination (cloud load balancer terminating TLS and re-originating HTTP over a shared network) is not supported. The KEK transits that hop in cleartext.
@@ -234,7 +223,7 @@ Remote TLS termination (cloud load balancer terminating TLS and re-originating H
 The implementation must maintain:
 
 1. KEK never in URL path or query string; only in the `Authorization` header.
-2. `UserServerPriv` and DEK plaintext wrapped in `ZeroizeOnDrop`; wiped on every exit path including errors and panics.
+2. `UserServerPriv` and DEK plaintext are explicitly wiped on every exit path including errors and panics.
 3. `KeyId` server-generated (UUID), never client-supplied.
 4. `IsOwner` checked before any Permission INSERT.
 5. Username NFC-normalized before DB operations.
@@ -249,10 +238,10 @@ The implementation must maintain:
 Deferred until after a solid 1.0. Each of these is a known limitation of the current design, not an oversight.
 
 - **Row-integrity signatures.** Add an Ed25519 signing keypair per user (priv wrapped under KEK alongside `UserServerPriv`). Creators sign `(Username, Projectname, KeyId, DEK)`; fetchers verify on open. Closes the DEK-substitution attack (§Known Row-Integrity Risks #1) and also defends against a malicious Alice shipping a bogus "DEK" to Bob at share time.
-- **End-to-end sharing.** Alice's client performs `SealedBox(DEK, bob_pub)` locally and ships an opaque blob; the server never sees DEK plaintext during sharing. Combined with signatures above, removes the server from the TCB for key sharing.
+- **End-to-end sharing.** Alice's client performs `seal(DEK, bob_pub)` locally and ships an opaque blob; the server never sees DEK plaintext during sharing. Combined with signatures above, removes the server from the TCB for key sharing.
 - **Public-key trust root.** TOFU pinning of `UserServerPub` in the client, or a signed pubkey record, to defeat pub-swap attacks (§Known Row-Integrity Risks #2).
 - **Username-enumeration timing hardening.** Constant-time response path for "no such user" vs. "AEAD failure" on the login path (dummy decrypt against a fixed dummy `UserServerPrivEnc`).
 - **DEK rotation.** Re-generate a DEK and re-share to all current grantees without changing `KeyId`.
 - **Audit log.** Tamper-evident append-only log of privileged operations (share, revoke, register, rewrap).
 - **UUIDv4 collision hardening.** The birthday bound on UUIDv4 (122 random bits) is astronomically safe for realistic key volumes, but a collision between two independently-generated `KeyId`s would break the Permission PK on insert and could, in adversarial generation scenarios, allow row-shadowing. Options: unique-check-with-retry on insert, switch to UUIDv7 (timestamp-prefixed, still collision-resistant on the random tail), or widen the random portion.
-- **Compile-time SQL verification.** The `db` crate currently uses runtime-checked `sqlx::query(...)` to keep `cargo build` hermetic (no `DATABASE_URL`, no `.sqlx/` cache to maintain). Upgrade path: switch to `sqlx::query!` / `query_as!`, generate the `.sqlx/` cache via `cargo sqlx prepare`, commit it, and gate CI on `cargo sqlx prepare --check` so schema drift fails the build rather than surfacing at runtime.
+- **Compile-time SQL verification.** Queries are currently checked at runtime. If the implementation language and DB toolchain support it, statically verify SQL against the live schema at build time so schema drift fails the build rather than surfacing as a runtime error.
